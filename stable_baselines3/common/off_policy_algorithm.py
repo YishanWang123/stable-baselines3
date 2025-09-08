@@ -144,6 +144,10 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             self.policy_kwargs["use_sde"] = self.use_sde
         # For gSDE only
         self.use_sde_at_warmup = use_sde_at_warmup
+        # === For chunked-action bookkeeping (norm / next_norm) ===
+        self._prev_norm_flat = None     # (n_envs, H*A) of previous step
+        self._prev_dones = None         # (n_envs,) bool
+        self._has_prev = False
 
     def _convert_train_freq(self) -> None:
         """
@@ -489,6 +493,16 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                     if self._vec_normalize_env is not None:
                         next_obs[i] = self._vec_normalize_env.unnormalize_obs(next_obs[i, :])  # type: ignore[assignment]
 
+        if all(("norm_action" in info and "actual_norm_action" in info) for info in infos):
+            norm_actions = np.stack([info["norm_action"] for info in infos], axis=0)              # (n_envs, H, A)
+            actual_norm_actions = np.stack([info["actual_norm_action"] for info in infos], axis=0)# (n_envs, H, A)
+            n_envs, H, A = norm_actions.shape
+            norm_flat = norm_actions.reshape(n_envs, H * A)                     # (n_envs, H*A)
+            actual_norm_flat = actual_norm_actions.reshape(n_envs, H * A)       # (n_envs, H*A)
+        else:
+            norm_flat = None
+            actual_norm_flat = None 
+
         replay_buffer.add(
             self._last_original_obs,  # type: ignore[arg-type]
             next_obs,  # type: ignore[arg-type]
@@ -496,7 +510,13 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             reward_,
             dones,
             infos,
+            norm_action=norm_flat,
+            actual_norm_action=actual_norm_flat
         )
+
+        # 5) Cache current chunk for "next_norm" backfilling in collect_rollouts
+        self._curr_norm_flat = norm_flat                   # (n_envs, H*A) or None
+        self._curr_dones = np.array(dones, dtype=bool)     # (n_envs,)
 
         self._last_obs = new_obs
         # Save the unnormalized observation
@@ -546,6 +566,11 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         if self.use_sde:
             self.actor.reset_noise(env.num_envs)
 
+        # reset prev-cache
+        self._prev_norm_flat = None
+        self._prev_dones = None
+        self._has_prev = False
+
         callback.on_rollout_start()
         continue_training = True
         while should_collect_more_steps(train_freq, num_collected_steps, num_collected_episodes):
@@ -554,8 +579,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 self.actor.reset_noise(env.num_envs)
 
             # Select action randomly or according to policy
-            actions, buffer_actions = self._sample_action(learning_starts, action_noise, env.num_envs)
-
+            actions, buffer_actions = self._sample_action(learning_starts, action_noise, env.num_envs)  #action shape = (num_envs, action_dim * chunk_size)
             # Rescale and perform action
             new_obs, rewards, dones, infos = env.step(actions)
 
@@ -573,6 +597,31 @@ class OffPolicyAlgorithm(BaseAlgorithm):
 
             # Store data in replay buffer (normalized action and unnormalized observation)
             self._store_transition(replay_buffer, buffer_actions, new_obs, rewards, dones, infos)  # type: ignore[arg-type]
+
+            # === Back-fill "previous step" next_norm_actions using "current step" norm ===
+            if self._has_prev and getattr(self, "_curr_norm_flat", None) is not None:
+                # current just-written index
+                idx_cur = (replay_buffer.pos - 1) % replay_buffer.buffer_size
+                # previous index
+                idx_prev = (replay_buffer.pos - 2) % replay_buffer.buffer_size
+
+                # base: next_norm(prev) = norm(curr)
+                next_norm_for_prev = self._curr_norm_flat.copy()  # (n_envs, H*A)
+
+                # for envs that were done at prev, don't cross episode: use prev's norm
+                if self._prev_dones is not None and self._prev_norm_flat is not None:
+                    done_mask = self._prev_dones.astype(bool)
+                    if done_mask.any():
+                        next_norm_for_prev[done_mask] = self._prev_norm_flat[done_mask]
+
+                # write into buffer arrays
+                replay_buffer.next_norm_actions[idx_prev] = next_norm_for_prev
+                replay_buffer.use_next_norm_actions = True
+
+            # roll cache to prev
+            self._prev_norm_flat = getattr(self, "_curr_norm_flat", None)
+            self._prev_dones = np.array(dones, dtype=bool)
+            self._has_prev = self._prev_norm_flat is not None
 
             self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
 
@@ -595,6 +644,12 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                     # Log training infos
                     if log_interval is not None and self._episode_num % log_interval == 0:
                         self.dump_logs()
+        # === Flush last step: it has no "next step" — set its next_norm = itself ===
+        if self._has_prev and self._prev_norm_flat is not None:
+            idx_last = (replay_buffer.pos - 1) % replay_buffer.buffer_size
+            replay_buffer.next_norm_actions[idx_last] = self._prev_norm_flat
+            replay_buffer.use_next_norm_actions = True
+
         callback.on_rollout_end()
 
         return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training)

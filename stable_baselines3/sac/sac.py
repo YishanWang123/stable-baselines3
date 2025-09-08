@@ -4,17 +4,16 @@ import numpy as np
 import torch as th
 from gymnasium import spaces
 from torch.nn import functional as F
-
+import torch.nn as nn
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
-from stable_baselines3.sac.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, SACPolicy
+from stable_baselines3.sac.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, SACPolicy, ResidualActorHead
 
 SelfSAC = TypeVar("SelfSAC", bound="SAC")
-
 
 class SAC(OffPolicyAlgorithm):
     """
@@ -117,6 +116,7 @@ class SAC(OffPolicyAlgorithm):
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
         actor_gradient_steps: int = -1,
+        res_actor_gradient_steps: int = -1,
         action_norm_regularization: float = 0.0,
     ):
         super().__init__(
@@ -155,6 +155,7 @@ class SAC(OffPolicyAlgorithm):
         self.target_update_interval = target_update_interval
         self.ent_coef_optimizer: Optional[th.optim.Adam] = None
         self.actor_gradient_steps = actor_gradient_steps
+        self.res_actor_gradient_steps = res_actor_gradient_steps
         self.action_norm_regularization = action_norm_regularization
 
         if _init_setup_model:
@@ -195,6 +196,42 @@ class SAC(OffPolicyAlgorithm):
             # is passed
             self.ent_coef_tensor = th.tensor(float(self.ent_coef), device=self.device)
 
+        # === Residual Actor Head ===
+        feat_dim = self.policy.actor.features_dim   # 从 policy 的 actor 抽特征维度
+        action_dim = self.policy.actor.mu.out_features  # 动作维度
+        self.res_actor_head = ResidualActorHead(feat_dim, action_dim).to(self.device)
+        self.res_actor_head.optimizer = th.optim.Adam(
+            self.res_actor_head.parameters(),
+            lr=self.lr_schedule(1)
+        )
+
+        # === Clean Critic ===
+        # self.clean_critic = ContinuousCritic(
+        #     self.policy.observation_space,
+        #     self.policy.action_space,
+        #     net_arch=[256, 256],
+        #     activation_fn=nn.ReLU,
+        #     share_features_extractor=False,
+        # ).to(self.device)
+        self.clean_critic = self.policy.make_critic(features_extractor=None)
+
+        self.clean_critic.optimizer = th.optim.Adam(
+            self.clean_critic.parameters(),
+            lr=self.lr_schedule(1)
+        )
+
+        # === target for clean critic ===
+        # self.clean_critic_target = ContinuousCritic(
+        #     self.policy.observation_space,
+        #     self.policy.action_space,
+        #     net_arch=[256, 256],
+        #     activation_fn=nn.ReLU,
+        #     share_features_extractor=False,
+        # ).to(self.device)
+        self.clean_critic_target = self.policy.make_critic(features_extractor=None)
+        self.clean_critic_target.load_state_dict(self.clean_critic.state_dict())
+        self.clean_critic_target.set_training_mode(False)
+
     def _create_aliases(self) -> None:
         self.actor = self.policy.actor
         self.critic = self.policy.critic
@@ -204,7 +241,10 @@ class SAC(OffPolicyAlgorithm):
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
         # Update optimizers learning rate
-        optimizers = [self.actor.optimizer, self.critic.optimizer]
+        self.res_actor_head.train()
+        self.clean_critic.train()
+        self.clean_critic_target.set_training_mode(False)
+        optimizers = [self.actor.optimizer, self.critic.optimizer, self.clean_critic.optimizer, self.res_actor_head.optimizer]
         if self.ent_coef_optimizer is not None:
             optimizers += [self.ent_coef_optimizer]
 
@@ -213,11 +253,21 @@ class SAC(OffPolicyAlgorithm):
 
         ent_coef_losses, ent_coefs = [], []
         actor_losses, critic_losses = [], []
-
+        clean_critic_losses = []
+        res_actor_losses = []
         if self.actor_gradient_steps < 0:
             actor_gradient_idx = np.linspace(0, gradient_steps-1, gradient_steps, dtype=int)
         else:
             actor_gradient_idx = np.linspace(int(gradient_steps / self.actor_gradient_steps) - 1, gradient_steps-1, self.actor_gradient_steps, dtype=int)
+        
+        if self.res_actor_gradient_steps < 0:
+            res_actor_gradient_idx = np.linspace(0, gradient_steps - 1, gradient_steps, dtype=int)
+        else:
+            res_actor_gradient_idx = np.linspace(
+                int(gradient_steps / self.res_actor_gradient_steps) - 1,
+                gradient_steps - 1,
+                self.res_actor_gradient_steps,
+                dtype=int)
 
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
@@ -298,6 +348,47 @@ class SAC(OffPolicyAlgorithm):
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
                 # Copy running stats, see GH issue #996
                 polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
+            # === train clean critic ===
+            with th.no_grad(): 
+                feats_next = self.policy.actor.extract_features(replay_data.next_observations, self.policy.actor.features_extractor).detach()    
+                next_res_action = self.res_actor_head(feats_next)
+                next_actual_norm_action = next_res_action + replay_data.next_norm_actions
+                next_clean_qs  = th.cat(self.clean_critic_target(replay_data.next_observations, next_actual_norm_action), dim= 1)
+                next_clean_q, _ = th.min(next_clean_qs, dim=1, keepdim=True)
+                target_clean_q = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_clean_q
+            #get current clean q
+            current_clean_qs = self.clean_critic(replay_data.observations, replay_data.actual_norm_actions)
+            clean_critic_loss = 0.5 * sum(F.mse_loss(current_clean_q, target_clean_q) for current_clean_q in current_clean_qs)
+            assert isinstance(clean_critic_loss, th.Tensor)
+            clean_critic_losses.append(clean_critic_loss.item())
+            self.clean_critic.optimizer.zero_grad()
+            clean_critic_loss.backward()
+            self.clean_critic.optimizer.step()
+            
+            # ===train res_actor_head ===
+            if gradient_step in res_actor_gradient_idx:
+            # if gradient_step in res_actor_gradient_idx:
+            #compute res_actor_loss
+                feats = self.policy.actor.extract_features(replay_data.observations, self.policy.actor.features_extractor).detach() 
+                res_action = self.res_actor_head(feats)
+                actual_norm_action = res_action + replay_data.norm_actions
+                clean_q_pi = th.cat(self.clean_critic(replay_data.observations, actual_norm_action), dim=1)
+                res_actor_loss = -(th.min(clean_q_pi, dim=1, keepdim=True)[0]).mean()
+                res_actor_losses.append(res_actor_loss.item())
+                #optimize res_actor_head
+                self.res_actor_head.optimizer.zero_grad()
+                res_actor_loss.backward()
+                self.res_actor_head.optimizer.step()
+
+            # ===update target clean critic===
+            if gradient_step % self.target_update_interval == 0:
+                polyak_update(self.clean_critic.parameters(), self.clean_critic_target.parameters(), self.tau)  
+                # Copy running stats, see GH issue #996
+                # polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
+
+
+
+
 
         self._n_updates += gradient_steps
 
@@ -305,6 +396,8 @@ class SAC(OffPolicyAlgorithm):
         self.logger.record("train/ent_coef", np.mean(ent_coefs))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
+        self.logger.record("train/clean_critic_loss", np.mean(clean_critic_losses))
+        self.logger.record("train/res_actor_loss", np.mean(res_actor_losses))
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
 
@@ -327,10 +420,10 @@ class SAC(OffPolicyAlgorithm):
         )
 
     def _excluded_save_params(self) -> list[str]:
-        return super()._excluded_save_params() + ["actor", "critic", "critic_target"]  # noqa: RUF005
+        return super()._excluded_save_params() + ["actor", "critic", "critic_target", "clean_critic", "clean_critic_target", "res_actor_head" ]  # noqa: RUF005
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
-        state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]
+        state_dicts = ["policy", "actor.optimizer", "critic.optimizer", "clean_critic.optimizer", "res_actor_head.optimizer"]
         if self.ent_coef_optimizer is not None:
             saved_pytorch_variables = ["log_ent_coef"]
             state_dicts.append("ent_coef_optimizer")

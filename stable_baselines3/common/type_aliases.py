@@ -52,6 +52,10 @@ class ReplayBufferSamples(NamedTuple):
     next_observations: th.Tensor
     dones: th.Tensor
     rewards: th.Tensor
+    norm_actions: Optional[th.Tensor] = None  # For DDPG, TD3 and SAC
+    next_norm_actions: Optional[th.Tensor] = None  # For DDPG, TD3 and SAC
+    actual_norm_actions: Optional[th.Tensor] = None  # For DDPG, TD3 and SAC
+    
 
 
 class DictReplayBufferSamples(NamedTuple):

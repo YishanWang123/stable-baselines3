@@ -245,6 +245,14 @@ class ReplayBuffer(BaseBuffer):
 
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+
+        self.norm_actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=self._maybe_cast_dtype(action_space.dtype))
+        self.next_norm_actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=self._maybe_cast_dtype(action_space.dtype))
+        self.actual_norm_actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=self._maybe_cast_dtype(action_space.dtype))
+        self.use_norm_actions = False
+        self.use_next_norm_actions = False
+        self.use_actual_norm_actions = False
+
         # Handle timeouts termination properly if needed
         # see https://github.com/DLR-RM/stable-baselines3/issues/284
         self.handle_timeout_termination = handle_timeout_termination
@@ -276,6 +284,9 @@ class ReplayBuffer(BaseBuffer):
         done: np.ndarray,
         infos: list[dict[str, Any]],
         noise_action: Optional[np.ndarray] = None,
+        norm_action: Optional[np.ndarray] = None,
+        next_norm_action: Optional[np.ndarray] = None,
+        actual_norm_action: Optional[np.ndarray] = None
     ) -> None:
         # Reshape needed when using multiple envs with discrete observations
         # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
@@ -300,6 +311,18 @@ class ReplayBuffer(BaseBuffer):
             self.noise_actions[self.pos] = np.array(noise_action)
         self.rewards[self.pos] = np.array(reward)
         self.dones[self.pos] = np.array(done)
+        if norm_action is not None:
+            self.use_norm_actions = True
+            self.norm_actions[self.pos] = norm_action.reshape((self.n_envs, self.action_dim))
+        
+        if next_norm_action is not None:
+            self.use_next_norm_actions = True
+            self.next_norm_actions[self.pos] = next_norm_action.reshape((self.n_envs, self.action_dim))
+
+        if actual_norm_action is not None:
+            self.use_actual_norm_actions = True
+            self.actual_norm_actions[self.pos] = actual_norm_action.reshape((self.n_envs, self.action_dim))
+
 
         if self.handle_timeout_termination:
             self.timeouts[self.pos] = np.array([info.get("TimeLimit.truncated", False) for info in infos])
@@ -361,7 +384,33 @@ class ReplayBuffer(BaseBuffer):
                 (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
                 self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
             )
-        return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
+        if self.use_noise_actions:
+            base_elems = data[:5]  # (obs, actions, next_obs, dones, rewards)
+        else:
+            base_elems = data # (obs, actions, next_obs, dones, rewards)
+        base_tensors = tuple(map(self.to_torch, base_elems))
+        # Add optional norm actions
+        if self.use_norm_actions:
+            norm_actions_t = self.to_torch(self.norm_actions[batch_inds, env_indices, :])
+        else:
+            norm_actions_t = None
+
+        if self.use_next_norm_actions:
+            next_norm_actions_t = self.to_torch(self.next_norm_actions[batch_inds, env_indices, :])
+        else:
+            next_norm_actions_t = None
+        
+        if self.use_actual_norm_actions:
+            actual_norm_actions_t = self.to_torch(self.actual_norm_actions[batch_inds, env_indices, :])
+        else:
+            actual_norm_actions_t = None
+        
+        return ReplayBufferSamples(
+            *base_tensors,
+            norm_actions=norm_actions_t,
+            next_norm_actions=next_norm_actions_t,
+            actual_norm_actions=actual_norm_actions_t,
+        )
 
     @staticmethod
     def _maybe_cast_dtype(dtype: np.typing.DTypeLike) -> np.typing.DTypeLike:

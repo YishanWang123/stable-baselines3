@@ -88,6 +88,7 @@ class Actor(BasePolicy):
         latent_pi_net = create_mlp(features_dim, -1, net_arch, activation_fn, post_linear_modules=post_linear_modules)
         self.latent_pi = nn.Sequential(*latent_pi_net)
         last_layer_dim = net_arch[-1] if len(net_arch) > 0 else features_dim
+        self.res_action_head = ResidualActorHead(features_dim, action_dim)
 
         if self.use_sde:
             self.action_dist = StateDependentNoiseDistribution(
@@ -180,7 +181,13 @@ class Actor(BasePolicy):
     def forward(self, obs: PyTorchObs, deterministic: bool = False) -> th.Tensor:
         mean_actions, log_std, kwargs = self.get_action_dist_params(obs)
         # Note: the action is squashed
-        return self.action_dist.actions_from_params(mean_actions, log_std, deterministic=deterministic, **kwargs)
+
+        noise = self.action_dist.actions_from_params(mean_actions, log_std, deterministic=deterministic, **kwargs)
+        feature = self.extract_features(obs, self.features_extractor)
+        res_action = self.res_action_head(feature)
+        return th.cat([noise, res_action(feature)], dim=1)
+
+        # return self.action_dist.actions_from_params(mean_actions, log_std, deterministic=deterministic, **kwargs)
 
     def action_log_prob(self, obs: PyTorchObs) -> tuple[th.Tensor, th.Tensor]:
         mean_actions, log_std, kwargs = self.get_action_dist_params(obs)
@@ -362,6 +369,7 @@ class SACPolicy(BasePolicy):
     def make_critic(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> ContinuousCritic:
         critic_kwargs = self._update_features_extractor(self.critic_kwargs, features_extractor)
         return ContinuousCritic(**critic_kwargs).to(self.device)
+    
 
     def forward(self, obs: PyTorchObs, deterministic: bool = False) -> th.Tensor:
         return self._predict(obs, deterministic=deterministic)
@@ -384,6 +392,21 @@ class SACPolicy(BasePolicy):
 
 MlpPolicy = SACPolicy
 
+class ResidualActorHead(nn.Module):
+    """
+    MLP input: features (from policy.actor.features_extractor),
+    output is flatten chunk action(dim = env.action_space.shape[0])
+    """
+    def __init__(self, in_dim: int, action_dim: int, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, action_dim)
+        )
+
+    def forward(self, feats: th.Tensor) -> th.Tensor:
+        return self.net(feats)  # (B, action_dim)
 
 class CnnPolicy(SACPolicy):
     """
