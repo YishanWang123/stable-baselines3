@@ -182,12 +182,7 @@ class Actor(BasePolicy):
         mean_actions, log_std, kwargs = self.get_action_dist_params(obs)
         # Note: the action is squashed
 
-        noise = self.action_dist.actions_from_params(mean_actions, log_std, deterministic=deterministic, **kwargs)
-        feature = self.extract_features(obs, self.features_extractor)
-        res_action = self.res_action_head(feature)
-        return th.cat([noise, res_action(feature)], dim=1)
-
-        # return self.action_dist.actions_from_params(mean_actions, log_std, deterministic=deterministic, **kwargs)
+        return self.action_dist.actions_from_params(mean_actions, log_std, deterministic=deterministic, **kwargs)
 
     def action_log_prob(self, obs: PyTorchObs) -> tuple[th.Tensor, th.Tensor]:
         mean_actions, log_std, kwargs = self.get_action_dist_params(obs)

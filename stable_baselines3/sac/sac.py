@@ -161,6 +161,35 @@ class SAC(OffPolicyAlgorithm):
         if _init_setup_model:
             self._setup_model()
 
+    # 在 SAC 类里加一个小工具函数
+    def _bind_residual_getter(self, env) -> None:
+        # 只有包装器支持时才绑定
+        if not (hasattr(env, "set_residual_getter")
+                and hasattr(env, "action_horizon")
+                and hasattr(env, "action_dim")):
+            return
+
+        H = int(getattr(env, "action_horizon"))
+        A = int(getattr(env, "action_dim"))
+
+        def residual_from_obs(obs_tensor: th.Tensor) -> th.Tensor:
+            """
+            obs_tensor: torch[ B, obs_dim ]（wrapper 在 step_wait 里已经缓存为 torch）
+            return:     torch[ B, H, A ] residual
+            """
+            with th.no_grad():
+                # 用 actor 的特征提取器
+                feats = self.policy.actor.extract_features(
+                    obs_tensor, self.policy.actor.features_extractor
+                )
+                # 经过 residual head，得到 [B, H*A]
+                res_flat = self.res_actor_head(feats)   # shape: [B, H*A]
+                B = res_flat.shape[0]
+                return res_flat.view(B, H, A)
+
+        # 注入给 wrapper
+        env.set_residual_getter(residual_from_obs)
+
     def _setup_model(self) -> None:
         super()._setup_model()
         self._create_aliases()
@@ -231,6 +260,7 @@ class SAC(OffPolicyAlgorithm):
         self.clean_critic_target = self.policy.make_critic(features_extractor=None)
         self.clean_critic_target.load_state_dict(self.clean_critic.state_dict())
         self.clean_critic_target.set_training_mode(False)
+        self._bind_residual_getter(self.env)
 
     def _create_aliases(self) -> None:
         self.actor = self.policy.actor
