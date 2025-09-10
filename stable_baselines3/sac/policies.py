@@ -392,16 +392,21 @@ class ResidualActorHead(nn.Module):
     MLP input: features (from policy.actor.features_extractor),
     output is flatten chunk action(dim = env.action_space.shape[0])
     """
-    def __init__(self, in_dim: int, action_dim: int, hidden: int = 256):
+    def __init__(self, in_dim: int, action_dim: int, hidden: int = 256, res_coef: float = 0.05):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
             nn.Linear(hidden, action_dim)
         )
+        self.res_coef = res_coef
 
     def forward(self, feats: th.Tensor) -> th.Tensor:
-        return self.net(feats)  # (B, action_dim)
+        out_m = th.tanh(self.net(feats))
+        out = out_m * self.res_coef
+
+        # return self.net(feats)  # (B, action_dim)
+        return out
 
 class CnnPolicy(SACPolicy):
     """

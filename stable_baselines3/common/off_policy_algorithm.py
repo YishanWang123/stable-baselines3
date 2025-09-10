@@ -496,6 +496,10 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         if all(("norm_action" in info and "actual_norm_action" in info) for info in infos):
             norm_actions = np.stack([info["norm_action"] for info in infos], axis=0)              # (n_envs, H, A)
             actual_norm_actions = np.stack([info["actual_norm_action"] for info in infos], axis=0)# (n_envs, H, A)
+            # if getattr(self, "_dbg_printed", 0) < 5:
+            #     print("[_store_transition] norm_actions", norm_actions.shape,"actual_norm_actions", actual_norm_actions.shape)
+            #     self._dbg_printed = getattr(self, "_dbg_printed", 0) + 1
+            #     import pdb; pdb.set_trace()
             n_envs, H, A = norm_actions.shape
             norm_flat = norm_actions.reshape(n_envs, H * A)                     # (n_envs, H*A)
             actual_norm_flat = actual_norm_actions.reshape(n_envs, H * A)       # (n_envs, H*A)
@@ -567,9 +571,9 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             self.actor.reset_noise(env.num_envs)
 
         # reset prev-cache
-        self._prev_norm_flat = None
-        self._prev_dones = None
-        self._has_prev = False
+        # self._prev_norm_flat = None
+        # self._prev_dones = None
+        # self._has_prev = False
 
         callback.on_rollout_start()
         continue_training = True
@@ -582,6 +586,11 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             actions, buffer_actions = self._sample_action(learning_starts, action_noise, env.num_envs)  #action shape = (num_envs, action_dim * chunk_size)
             # Rescale and perform action
             new_obs, rewards, dones, infos = env.step(actions)
+            # if isinstance(infos, dict):
+            #     print("infos keys:", list(infos.keys()))
+            # else:  # VecEnv: list/tuple of dict
+            #     print("infos[0] keys:", list(infos[0].keys()))
+            # import pdb; pdb.set_trace()
 
             self.num_timesteps += env.num_envs
             num_collected_steps += 1
@@ -604,7 +613,14 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 idx_cur = (replay_buffer.pos - 1) % replay_buffer.buffer_size
                 # previous index
                 idx_prev = (replay_buffer.pos - 2) % replay_buffer.buffer_size
-
+                # if idx_prev >= 0 and replay_buffer.next_norm_actions is not None:
+                #     # 对比 prev 的 next_norm 和当前的 norm
+                #     print(f"[Check] prev idx {idx_prev} next_norm[0,:3] =",
+                #         replay_buffer.next_norm_actions[idx_prev, 0, :3],
+                #         " | cur norm[0,:3] =",
+                #         replay_buffer.norm_actions[idx_cur, 0, :3])
+                # self._dbg_checked = getattr(self, "_dbg_checked", 0) + 1
+                # import pdb; pdb.set_trace()
                 # base: next_norm(prev) = norm(curr)
                 next_norm_for_prev = self._curr_norm_flat.copy()  # (n_envs, H*A)
 
@@ -617,7 +633,15 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 # write into buffer arrays
                 replay_buffer.next_norm_actions[idx_prev] = next_norm_for_prev
                 replay_buffer.use_next_norm_actions = True
-
+                # env_id = 0
+#                 print(
+#                     f"[AfterWrite] prev idx {idx_prev} done={bool(self._prev_dones[env_id])} | "
+#                     f"prev.next_norm[:3]={replay_buffer.next_norm_actions[idx_prev, env_id, :3]} | "
+#                     f"cur.norm[:3]={replay_buffer.norm_actions[idx_cur, env_id, :3]} | "
+#                     f"curr_flat[:3]={self._curr_norm_flat[env_id, :3]} | "
+#                     f"prev_flat[:3]={None if self._prev_norm_flat is None else self._prev_norm_flat[env_id, :3]}"
+# )
+#                 pdb.set_trace()
             # roll cache to prev
             self._prev_norm_flat = getattr(self, "_curr_norm_flat", None)
             self._prev_dones = np.array(dones, dtype=bool)

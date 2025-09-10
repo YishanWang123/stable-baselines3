@@ -118,6 +118,7 @@ class SAC(OffPolicyAlgorithm):
         actor_gradient_steps: int = -1,
         res_actor_gradient_steps: int = -1,
         action_norm_regularization: float = 0.0,
+        res_coef: float = 0.05,  # 给 ResidualActorHead 用
     ):
         super().__init__(
             policy,
@@ -157,6 +158,7 @@ class SAC(OffPolicyAlgorithm):
         self.actor_gradient_steps = actor_gradient_steps
         self.res_actor_gradient_steps = res_actor_gradient_steps
         self.action_norm_regularization = action_norm_regularization
+        self.res_coef = res_coef
 
         if _init_setup_model:
             self._setup_model()
@@ -228,7 +230,7 @@ class SAC(OffPolicyAlgorithm):
         # === Residual Actor Head ===
         feat_dim = self.policy.actor.features_dim   # 从 policy 的 actor 抽特征维度
         action_dim = self.policy.actor.mu.out_features  # 动作维度
-        self.res_actor_head = ResidualActorHead(feat_dim, action_dim).to(self.device)
+        self.res_actor_head = ResidualActorHead(feat_dim, action_dim, res_coef=self.res_coef).to(self.device)
         self.res_actor_head.optimizer = th.optim.Adam(
             self.res_actor_head.parameters(),
             lr=self.lr_schedule(1)
@@ -428,6 +430,8 @@ class SAC(OffPolicyAlgorithm):
         self.logger.record("train/critic_loss", np.mean(critic_losses))
         self.logger.record("train/clean_critic_loss", np.mean(clean_critic_losses))
         self.logger.record("train/res_actor_loss", np.mean(res_actor_losses))
+        self.logger.record("train/clean_q_pi", clean_q_pi.mean().item())
+        self.logger.record("train/target_clean_q", target_clean_q.mean().item())
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
 
