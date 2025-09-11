@@ -119,6 +119,7 @@ class SAC(OffPolicyAlgorithm):
         res_actor_gradient_steps: int = -1,
         action_norm_regularization: float = 0.0,
         res_coef: float = 0.05,  # 给 ResidualActorHead 用
+        res_prob: float = 0,
     ):
         super().__init__(
             policy,
@@ -159,6 +160,7 @@ class SAC(OffPolicyAlgorithm):
         self.res_actor_gradient_steps = res_actor_gradient_steps
         self.action_norm_regularization = action_norm_regularization
         self.res_coef = res_coef
+        self.res_prob = res_prob
 
         if _init_setup_model:
             self._setup_model()
@@ -187,7 +189,12 @@ class SAC(OffPolicyAlgorithm):
                 # 经过 residual head，得到 [B, H*A]
                 res_flat = self.res_actor_head(feats)   # shape: [B, H*A]
                 B = res_flat.shape[0]
-                return res_flat.view(B, H, A)
+                # return res_flat.view(B, H, A)
+                if th.rand(1).item() < self.res_prob:
+                    return res_flat.view(B, H, A)
+                else:
+                    return th.zeros(B, H, A, device=self.device)
+
 
         # 注入给 wrapper
         env.set_residual_getter(residual_from_obs)
